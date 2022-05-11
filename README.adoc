@@ -1,0 +1,5 @@
+Use `tcp_raw_recorder.py` to save range and angle data from the 3D scanner to a text file.
+
+Use `file_ply_generator.py` to convert the text file to an ASCII PLY file.
+
+Use `file_pc_viewer.py` to visualize the impact of calibration parameter changes on the point cloud.
