@@ -8,13 +8,12 @@ import pathlib
 from alive_progress import alive_bar
 
 HOST = '192.168.2.69'
+#HOST = '192.168.144.201'
 PORT = 6666
 
 PACKED_POINT_LEN = 7
 
-TICKS_PER_REV = 20390
-UP_PITCH = -91
-FOWARD_OFFSET_MM = 12
+TICKS_PER_REV = 25600
 
 running = True
 

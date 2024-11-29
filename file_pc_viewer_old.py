@@ -20,12 +20,6 @@ from pyqtgraph.Qt import QtCore, QtWidgets
 from typing import List
 
 REPORTED_TICKS_PER_REV = 20390
-R_IDX = 0
-T_IDX = 1
-P_IDX = 2
-X_IDX = 0
-Y_IDX = 1
-Z_IDX = 2
 
 @dataclasses.dataclass
 class ScanParams:
@@ -39,100 +33,97 @@ class ScanParams:
 class PointCloudParser:
     def __init__(self, txt_path: pathlib.Path):
         self.txt_path = txt_path
-
-        self.params = ScanParams()
-        self.raw_rtt = np.array([]) # radius, theta, ticks
-        self.rtp = np.array([]) # radius, theta, phi
-        self.xyz = np.array([]) # points
-        self.nxyz = np.array([]) # normals
-        self.rgba = np.array([]) # colors for pyqtgraph
-
-        self.xyz_trimmed = np.array([])
-        self.rgba_trimmed = np.array([])
-
-        self.r_hist_y = np.array([])
-        self.r_hist_x = np.array([])
-        
         # Parse the file into lists
+        self.pitches: List[float] = []
+        self.distances: List[float] = []
+        self.qualities: List[int] = []
+        self.ticks: List[int] = []
         self.read_txt_file(self.txt_path)
+            
+        self.points = np.zeros((len(self.pitches),3))
+        self.normals = np.zeros((len(self.pitches),3))
+        self.colors = np.zeros((len(self.pitches),4))
+            
+        self.prev_ticks = 0
+        self.tick_rollovers = 0
+        
+        self.params = ScanParams()
+        self.rtp: np.array = np.array([])
+        
         self.parse_all_points()
         
     def read_txt_file(self, txt_path: pathlib.Path):
         with open(txt_path, 'r') as txt_file:
             lines = txt_file.readlines()
-
-        self.raw_rtt = np.empty((len(lines),3))
-
-        for i in range(len(lines)):
-            pitch_str, dist_str, quality_str, ticks_str = lines[i].split(',')
-            self.raw_rtt[i,R_IDX] = float(dist_str)
-            self.raw_rtt[i,T_IDX] = math.radians(float(pitch_str))
-            self.raw_rtt[i,P_IDX] = int(ticks_str)
-
-        # Compute radius histogram
-        self.r_hist_y, self.r_hist_x = np.histogram(self.raw_rtt[:,R_IDX], 1000)
-
-    def apply_scan_params(self):
-        radius, theta, ticks = np.moveaxis(self.raw_rtt, -1, 0)
-
-        self.rtp = np.empty_like(self.raw_rtt)
-
-        pre_selector = ((slice(None),) * self.rtp.ndim)[:-1]
-
-        self.rtp[(*pre_selector, R_IDX)] = radius
-        self.rtp[(*pre_selector, T_IDX)] = theta + math.radians(self.params.up_pitch)
-        self.rtp[(*pre_selector, P_IDX)] = 2 * np.pi * ticks / self.params.ticks_per_rev
+        for line in lines:
+            pitch_str, dist_str, quality_str, ticks_str = line.split(',')
+            self.pitches.append(float(pitch_str))
+            self.distances.append(float(dist_str))
+            self.qualities.append(int(quality_str))
+            self.ticks.append(int(ticks_str))
     
-    def to_xyz(self):
-        r, t, p = np.moveaxis(self.rtp, -1, 0)
+    def parse_point(self, pitch, dist, ticks):
+        """Convert a line to a 3D cartesian point.
+                 __
+               (  --)-          <-- FORWARD_OFFSET
+            |----------------|
 
-        self.xyz = np.empty_like(self.rtp)
-
-        pre_selector = ((slice(None),) * self.xyz.ndim)[:-1]
-
-        self.xyz[(*pre_selector, X_IDX)] = (r * np.sin(t) + self.params.forward_offset) * np.cos(p) + (np.sin(p) * self.params.sideways_offset)
-        self.xyz[(*pre_selector, Y_IDX)] = (r * np.sin(t) + self.params.forward_offset) * np.sin(p) - (np.cos(p) * self.params.sideways_offset)
-        self.xyz[(*pre_selector, Z_IDX)] = r * np.cos(t)
-
-    def parse_normals(self):
-        r, t, p = np.moveaxis(self.rtp, -1, 0)
-
-        self.nxyz = np.empty_like(self.rtp)
-
-        pre_selector = ((slice(None),) * self.nxyz.ndim)[:-1]
-
-        self.nxyz[(*pre_selector, X_IDX)] = -1 * np.cos(t)
-        self.nxyz[(*pre_selector, Y_IDX)] = -1 * np.sin(t) * np.cos(p)
-        self.nxyz[(*pre_selector, Z_IDX)] = -1 * np.sin(t) * np.sin(p)
-
-    def parse_colors(self):
-        radius, _, ticks = np.moveaxis(self.raw_rtt, -1, 0)
-
-        self.rgba = np.empty((radius.shape[0], 4))
-
-        pre_selector = ((slice(None),) * self.rgba.ndim)[:-1]
-
-        self.rgba[(*pre_selector, 0)] = 1 - (radius / 4000)
-        self.rgba[(*pre_selector, 1)] = ticks / self.params.ticks_per_rev
-        self.rgba[(*pre_selector, 2)] = 1 - (ticks / self.params.ticks_per_rev)
-        self.rgba[(*pre_selector, 3)] = 0.8
-
-    def trim(self):
-        self.xyz_trimmed = self.xyz[self.params.end_point_trim:,:]
-        self.rgba_trimmed = self.rgba[self.params.end_point_trim:,:]
+        """
+        if dist == 0:
+            return None
+            
+        pitch_corr = math.radians(pitch) + math.radians(self.params.up_pitch)
+        
+        if abs(dist * math.sin(pitch_corr)) < 30:
+            return None
+        
+        if ticks < self.prev_ticks:
+            self.tick_rollovers += 1
+        self.prev_ticks = ticks
+        total_ticks = REPORTED_TICKS_PER_REV * self.tick_rollovers + ticks
+        theta_pre_tilt = math.radians(360 * (total_ticks % self.params.ticks_per_rev) / self.params.ticks_per_rev)
+        phi_pre_tilt = pitch_corr
+        dtheta = math.atan(math.sin(math.radians(self.params.z_tilt))*math.cos(phi_pre_tilt) / math.sin(phi_pre_tilt))
+        theta = theta_pre_tilt + dtheta
+        #phi = math.atan(math.sin(phi_pre_tilt)/(math.cos(math.radians(self.params.z_tilt))*math.cos(phi_pre_tilt)*math.cos(dtheta)))
+        phi = phi_pre_tilt
+        z = dist * math.cos(phi)
+        x = (dist * math.sin(phi) + self.params.forward_offset) * math.cos(theta) + (math.sin(theta) * self.params.sideways_offset)
+        y = (dist * math.sin(phi) + self.params.forward_offset) * math.sin(theta) - (math.cos(theta) * self.params.sideways_offset)
+        hemisphere = 0
+        if total_ticks % self.params.ticks_per_rev > self.params.ticks_per_rev / 2:
+            hemisphere = 1
+        
+        nz = -1 * math.cos(phi)
+        nx = -1 * math.sin(phi) * math.cos(theta)
+        ny = -1 * math.sin(phi) * math.sin(theta)
+        
+        return ((x, y, z), (nx, ny, nz), hemisphere)
         
     def parse_all_points(self):
-        self.apply_scan_params()
-        self.to_xyz()
-        self.parse_normals()
-        self.parse_colors()
-        self.trim()
+        self.prev_ticks = 0
+        self.tick_rollovers = 0
+        
+        for i in range(len(self.pitches)):
+            # Filter out the first and last 20 points
+            if i < self.params.end_point_trim or len(self.pitches) - i < self.params.end_point_trim:
+                self.points[i,:] = (0,0,0)
+                self.normals[i,:] = (0,0,0)
+                self.colors[i,:] = (0,0,0,0)
+                continue
+            tup = self.parse_point(self.pitches[i], self.distances[i], self.ticks[i])
+            if not tup:
+                continue
+            self.points[i,:] = tup[0]
+            self.normals[i,:] = tup[1]
+            col = int(150 * i / len(self.pitches)) + 100
+            self.colors[i,:] = ((355-col)/256, (tup[2]*255)/256, col/256, 0.8)
             
     def write_ply_file(self) -> None:
         with open(f"{self.txt_path.stem}.ply", 'w') as f:
             f.write('ply\n')
             f.write('format ascii 1.0\n')
-            f.write(f'element vertex {self.xyz.shape[0]}\n')
+            f.write(f'element vertex {len(self.pitches)}\n')
             f.write('property float x\n')
             f.write('property float y\n')
             f.write('property float z\n')
@@ -144,10 +135,10 @@ class PointCloudParser:
             f.write('property uchar blue\n')
             f.write('end_header\n')
                 
-            for i in range(self.xyz.shape[0]):
-                f.write(f'{self.xyz[i,0]:.3f} {self.xyz[i,1]:.3f} {self.xyz[i,2]:.3f} '
-                        f'{self.nxyz[i,0]:.3f} {self.nxyz[i,1]:.3f} {self.nxyz[i,2]:.3f} '
-                        f'{(self.rgba[i,0]*255):.0f} {(self.rgba[i,1]*255):.0f} {(self.rgba[i,2]*255):.0f}\n')
+            for i in range(len(self.pitches)):
+                f.write(f'{self.points[i,0]:.3f} {self.points[i,1]:.3f} {self.points[i,2]:.3f} '
+                        f'{self.normals[i,0]:.3f} {self.normals[i,1]:.3f} {self.normals[i,2]:.3f} '
+                        f'{self.colors[i,0]:.3f} {self.colors[i,1]:.3f} {self.colors[i,2]:.3f}\n')
 
 class ScanVisualizer(QtWidgets.QWidget):
     def __init__(self, pcp: PointCloudParser):
@@ -169,7 +160,6 @@ class ScanVisualizer(QtWidgets.QWidget):
         self.spin_ticks_per_rev.setValue(self.pcp.params.ticks_per_rev)
         
         self.spin_up_pitch = QtWidgets.QDoubleSpinBox()
-        self.spin_up_pitch.setMinimum(-180.)
         self.spin_up_pitch.setValue(self.pcp.params.up_pitch)
         self.spin_up_pitch.setSingleStep(0.05)
         
@@ -187,7 +177,7 @@ class ScanVisualizer(QtWidgets.QWidget):
         self.spin_sideways_offset.setValue(self.pcp.params.sideways_offset)
         
         self.spin_end_point_trim = QtWidgets.QSpinBox()
-        self.spin_end_point_trim.setMaximum(100000)
+        self.spin_end_point_trim.setMaximum(100)
         self.spin_end_point_trim.setValue(self.pcp.params.end_point_trim)
         
         self.form_layout = QtWidgets.QFormLayout()
@@ -200,14 +190,9 @@ class ScanVisualizer(QtWidgets.QWidget):
         
         self.button_open = QtWidgets.QPushButton("Open")
         self.button_export = QtWidgets.QPushButton("Export")
-
-        self.hist_widget = pg.GraphicsLayoutWidget(show=True)
-        self.hist_plt = self.hist_widget.addPlot()
-        self.hist_plt.plot(self.pcp.r_hist_x, self.pcp.r_hist_y, stepMode="center", fillLevel=0, fillOutline=True, brush=(0,0,255,150))
         
         self.sidebar_layout = QtWidgets.QVBoxLayout()
         self.sidebar_layout.addLayout(self.form_layout)
-        self.sidebar_layout.addWidget(self.hist_widget)
         self.sidebar_layout.addWidget(self.button_open)
         self.sidebar_layout.addWidget(self.button_export)
 
@@ -224,7 +209,7 @@ class ScanVisualizer(QtWidgets.QWidget):
         self.button_open.released.connect(self.open)
         self.button_export.released.connect(self.save)
 
-        self.scatter = gl.GLScatterPlotItem(pos=self.pcp.xyz_trimmed, color=self.pcp.rgba_trimmed, size=0.01, pxMode=False)
+        self.scatter = gl.GLScatterPlotItem(pos=self.pcp.points, color=self.pcp.colors, size=0.01, pxMode=False)
 
         self.gl.addItem(self.scatter)
 
@@ -238,7 +223,7 @@ class ScanVisualizer(QtWidgets.QWidget):
         self.pcp.params.end_point_trim = self.spin_end_point_trim.value()
         
         self.pcp.parse_all_points()
-        self.scatter.setData(pos=self.pcp.xyz_trimmed, color=self.pcp.rgba_trimmed)
+        self.scatter.setData(pos=self.pcp.points, color=self.pcp.colors)
         
     @QtCore.Slot()
     def open(self):
